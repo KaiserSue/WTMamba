@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 修改以下配置后，直接运行 bash cmd_scripts/train_new.sh。
-python_bin="$HOME/anaconda3/envs/Experiment/bin/python"
+python_bin="${PYTHON_BIN:-python}"
 dataset=cifar100  # Imagenet、cifar100 或 tinyimagenet
-data_dir="$HOME/dl_project/data/cifar100"
+data_dir="/home/apulis-dev/adhub/CIFAR100/0.1/cifar100"
+output_dir=checkpoints  # 输出根目录，相对路径以仓库根目录为基准
 gpus=1  # 使用 CUDA_VISIBLE_DEVICES 可见的 GPU
 model=WaveletTinyViM_S
 batch_size=128  # 每张 GPU 的 batch size
 epochs=300
-warmup_epochs=30
+warmup_epochs=20
 distillation_type=none  # none、hard 或 soft
 teacher_path=''  # hard / soft 蒸馏训练时填写权重路径或 HTTPS URL
 
+# 额外训练参数。命令行传入的参数会放在最后，可覆盖脚本中的同名选项。
 training_args=(
-    # --output-dir checkpoints
+    # --lr 0.001
     # --resume /path/to/checkpoint.pth
     # --eval  # 仅评估时与 --resume 一起启用
 )
@@ -22,8 +23,6 @@ training_args=(
 fail() { echo "train_new.sh: $*" >&2; exit 2; }
 
 launch_training() {
-    (($# == 0)) || fail '请在脚本顶部修改训练配置，然后直接运行 bash cmd_scripts/train_new.sh'
-
     local repo_root data_set visible
     local -a entry
     repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -43,10 +42,10 @@ launch_training() {
     ((gpus <= visible)) || fail "gpus=$gpus，当前可用 CUDA 设备数为 $visible"
 
     exec "$python_bin" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$gpus" \
-        "${entry[@]}" --model "$model" --data-set "$data_set" --data-path "$data_dir" \
+        "${entry[@]}" --model "$model" --data-set "$data_set" --data-path "$data_dir" --output-dir "$output_dir" \
         --batch-size "$batch_size" --epochs "$epochs" --warmup-epochs "$warmup_epochs" \
         --distillation-type "$distillation_type" --teacher-path "$teacher_path" --device cuda \
-        "${training_args[@]}"
+        "${training_args[@]}" "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
