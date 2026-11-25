@@ -2,7 +2,7 @@
 Train and eval functions used in main.py
 """
 import math
-import sys
+from itertools import islice
 from typing import Iterable, Optional
 
 import torch
@@ -12,6 +12,24 @@ from timm.utils import accuracy, ModelEma
 
 from losses import DistillationLoss
 import utils
+
+
+class _BatchLimit:
+    """Expose an exact prefix without fetching or training an extra batch."""
+
+    def __init__(self, loader, max_batches):
+        if max_batches is not None and (type(max_batches) is not int or max_batches <= 0):
+            raise ValueError('max_batches must be a positive integer or None')
+        self.loader = loader
+        self.count = len(loader) if max_batches is None else min(len(loader), max_batches)
+        if self.count == 0:
+            raise ValueError('training loader must not be empty')
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        return islice(self.loader, self.count)
 
 def set_bn_state(model):
     for m in model.modules():
@@ -25,7 +43,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     clip_mode: str = 'norm',
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
                     set_training_mode=True,
-                    set_bn_eval=False,):
+                    set_bn_eval=False, *, checkpoint_writer, max_batches=None):
+    data_loader = _BatchLimit(data_loader, max_batches)
     model.train(set_training_mode)
     if set_bn_eval:
         set_bn_state(model)
@@ -35,23 +54,35 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 100
 
-    for samples, targets in metric_logger.log_every(
-            data_loader, print_freq, header):
+    for batch_index, (samples, targets) in enumerate(metric_logger.log_every(
+            data_loader, print_freq, header)):
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+        with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
             outputs = model(samples)
             loss = criterion(samples, outputs, targets)
 
         loss_value = loss.item()
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
+        nonfinite = torch.tensor(int(not math.isfinite(loss_value)), device=device)
+        if utils.is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(nonfinite, op=torch.distributed.ReduceOp.MAX)
+        if nonfinite.item():
+            rank_losses = [{'rank': utils.get_rank(), 'loss': str(loss_value)}]
+            if utils.is_dist_avail_and_initialized():
+                gathered = [None] * utils.get_world_size()
+                torch.distributed.all_gather_object(gathered, rank_losses[0])
+                rank_losses = gathered
+            checkpoint_writer.save_error(epoch, batch_index, rank_losses)
+            # Do not let another rank exit and cause the launcher to kill the writer early.
+            if utils.is_dist_avail_and_initialized():
+                torch.distributed.barrier()
+            raise FloatingPointError(
+                f'Non-finite training loss at epoch={epoch}, batch_index={batch_index}: {rank_losses}')
 
         optimizer.zero_grad()
 
@@ -61,7 +92,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         loss_scaler(loss, optimizer, clip_grad=clip_grad, clip_mode=clip_mode,
                     parameters=model.parameters(), create_graph=is_second_order)
 
-        torch.cuda.synchronize()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         if model_ema is not None:
             model_ema.update(model)
 
@@ -70,7 +102,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {**{k: meter.global_avg for k, meter in metric_logger.meters.items()},
+            'batches': len(data_loader)}
 
 
 @torch.no_grad()

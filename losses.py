@@ -45,6 +45,8 @@ class DistillationLoss(torch.nn.Module):
         # don't backprop throught the teacher
         with torch.no_grad():
             teacher_outputs = self.teacher_model(inputs)
+        if not isinstance(teacher_outputs, torch.Tensor) or teacher_outputs.shape != outputs_kd.shape:
+            raise ValueError(f"teacher output shape must match student logits {tuple(outputs_kd.shape)}")
 
         if self.distillation_type == 'soft':
             T = self.tau

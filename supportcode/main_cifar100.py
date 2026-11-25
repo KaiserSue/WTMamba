@@ -9,17 +9,26 @@ input-size default (224) and preprocessing remain in effect. For a CPU check:
 """
 
 import argparse
-import datetime
+import sys
 from collections import Counter
 from pathlib import Path
+
+# Support both repository execution and the original copied-to-root layout.
+_entry_dir = Path(__file__).resolve().parent
+_repo_root = _entry_dir if (_entry_dir / 'model').is_dir() else _entry_dir.parent
+if not (_repo_root / 'main.py').is_file() or not (_repo_root / 'model').is_dir():
+    raise RuntimeError(f"Cannot locate training repository from {_entry_dir}")
+sys.path.insert(0, str(_repo_root))
 
 from data.cifar100_manifest import CIFAR100Manifest, build_dataset
 
 
 def main():
-    check_parser = argparse.ArgumentParser(add_help=False)
+    check_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     check_parser.add_argument('--check-data', action='store_true')
-    check_parser.add_argument('--data-path')
+    check_paths = check_parser.add_mutually_exclusive_group()
+    check_paths.add_argument('--data-path', dest='data_path')
+    check_paths.add_argument('--data-dir', dest='data_path')
     check_args, _ = check_parser.parse_known_args()
     if check_args.check_data:
         if not check_args.data_path:
@@ -39,7 +48,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         'TinyViM CIFAR-100 training and evaluation',
-        parents=[training.get_args_parser()],
+        parents=[training.get_args_parser()], allow_abbrev=False,
     )
     parser.set_defaults(
         data_set='CIFAR', distillation_type='none', warmup_epochs=30, batch_size=200,
@@ -47,18 +56,7 @@ def main():
     args = parser.parse_args()
     if args.data_set != 'CIFAR':
         parser.error('this entry requires --data-set CIFAR')
-    training.build_dataset = build_dataset
-    if args.resume and not args.eval:
-        args.output_dir = '/'.join(args.resume.split('/')[:-1])
-    elif args.output_dir:
-        args.output_dir = (
-            args.output_dir + f'/{args.model}/'
-            + datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-        )
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    else:
-        parser.error('--output_dir must not be empty')
-    training.main(args)
+    training.main(args, dataset_builder=build_dataset)
 
 
 if __name__ == '__main__':

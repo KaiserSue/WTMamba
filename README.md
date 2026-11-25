@@ -143,7 +143,9 @@ python main.py --model WaveletTinyViM_S --distillation-type none
 ```
 
 生产前向要求 CUDA；支持 FP32 参数与 CUDA autocast，Haar、频域分支、门控和 IWT 集中在 FP32
-执行。全模型 `.half()` 部署不在本次支持范围。Mamba2 及 causal-conv1d 延迟到新 Block 构造时
+执行。真实 batch128 训练曾在低频 SSM 的 FP16 计算中产生非有限输出；低频 Mamba2（含适配层）
+固定使用 FP32，并在分支内部关闭 autocast；外层开启 AMP 时也保持 FP32。
+该策略避免 SSM 内部 FP16 溢出；外部 Stem、Embedding 和分类头仍遵循调用方的 AMP 设置。全模型 `.half()` 部署不在本次支持范围。Mamba2 及 causal-conv1d 延迟到新 Block 构造时
 导入，导入错误直接上抛。Mamba2 的 `headdim=8`，内部宽度仍按 32 对齐，使头数及融合路径
 投影步长均为 8 的倍数；相比原 `headdim=64` 配置，相关权重形状发生变化。
 高频 RepConv 的 3×3、1×1 分支均使用 DW 卷积（实虚打包后
@@ -206,3 +208,102 @@ If you are interested in our work, please consider giving a 🌟 and citing our 
 Thanks to previous open-sourced repo: [Efficientformer](https://github.com/snap-research/EfficientFormer), [Swiftformer](https://github.com/Amshaker/SwiftFormer), [RepViT](https://github.com/THU-MIG/RepViT), [mmsegmentation](https://github.com/open-mmlab/mmsegmentation/tree/v0.30.0), [mmdetection](https://github.com/open-mmlab/mmdetection/tree/v2.28.2)
 
 
+
+## 统一训练入口（WaveletTinyViM / TinyViM）
+
+先执行 `conda activate Experiment`，再运行 `bash cmd_scripts/train_new.sh --help` 查看全部参数。
+原 `cmd_scripts/train.sh` 保留原样。新脚本使用当前环境的 Python 启动单机 torchrun，
+每张 GPU 一个进程；`CUDA_VISIBLE_DEVICES=0,1` 配合 `--gpus 2` 指定两张可见卡。
+脚本可从仓库外调用，数据路径支持空格及 `~`。
+
+| 参数 | 默认值 | 合法值与约束 |
+| --- | --- | --- |
+| `--dataset` | `Imagenet` | 区分大小写：`Imagenet`、`cifar100`、`tinyimagenet` |
+| `--data-dir` | 必填 | 对应数据集的可读根目录；与 `--data-path` 不可混用 |
+| `--gpus` | 1 | 正整数，不超过当前可见 CUDA GPU 数 |
+| `--model` | `WaveletTinyViM_S` | `WaveletTinyViM_S/B/L`、`TinyViM_S/B/L` 六个完整注册名 |
+| `--batch-size` | ImageNet 256，其他 200 | 正整数，每 GPU 进程的 batch；全局 batch=batch×GPU 数 |
+| `--epochs` | 300 | 正整数；恢复后必须大于 start_epoch |
+| `--warmup-epochs` | ImageNet 5，其他 30 | 0≤值<epochs |
+| `--cooldown-epochs` | 10 | 非负整数 |
+| `--input-size` | 224 | 整数≥64；小尺寸需自行核对 BatchNorm 有效样本数 |
+| `--lr` | 0.001 | 有限正数；有效 lr=基础 lr×batch×GPU 数/512 |
+| `--output-dir` | `checkpoints` | 非空、可写；兼容 `--output_dir` |
+| `--resume` | 空 | 同架构、同类别、同蒸馏头的未融合检查点，本地文件或 HTTPS |
+| `--eval` | 关闭 | 必须同时给出 `--resume`；不创建教师或训练 loader |
+| `--distillation-type` | `none` | `none`、`hard`、`soft` |
+| `--teacher-model` | `regnety_160` | 支持 timm 分类工厂协议且输出单个 logits 张量的教师 |
+| `--teacher-path` | 空 | hard/soft 训练必填，本地文件或 HTTPS；none/eval 不读取 |
+| `--distillation-alpha` | 0.5 | 有限数，0≤值≤1 |
+| `--distillation-tau` | 1.0 | 有限正数，soft 蒸馏温度 |
+| `--num-workers` | 10 | 非负整数；兼容 `--num_workers` |
+| `--seed` | 0 | 整数，0≤值≤2³²−1 |
+
+其他参数沿用 `main.py`，命令行覆盖数据集专属默认值。`--data-set`、`--data-path`、
+`--world_size`、`--dist_url` 和非 cuda 的 `--device` 由新脚本拒绝，防止覆盖其路由或进程配置。
+直接运行 `main.py` 或专用入口时保留它们原有默认模型与蒸馏默认值。
+
+CIFAR-100 读取 `train.txt/val.txt` 及图片，保留完整 100 类标签映射；Tiny ImageNet
+读取原始 `train/`、`val/images/` 与 `val/val_annotations.txt`，要求 200 类。
+ImageNet 读取原有 `train/val` 类别目录或 tar，分类头为 1000 类。
+`python supportcode/main_cifar100.py --check-data --data-dir ROOT` 和
+`python supportcode/main_tinyimagenet.py --check-data --data-dir ROOT` 可单独检查数据。
+仓库内直接训练既支持这两个文件路径，也支持 `python -m supportcode.main_cifar100` 等模块形式。
+
+下面两条命令用于完整真实数据训练验收：每卡 batch=128、输入224、1 epoch，保留正常增强、
+mixup/cutmix、BatchNorm、RASampler 与 drop_last；验证 batch=192。不会裁减数据或限制 batch 数。
+
+```bash
+bash cmd_scripts/train_new.sh --dataset cifar100 --data-dir /home/kaiser/dl_project/data/cifar100 --gpus 1 --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0 --output-dir debug-output/wavelet_training/cifar100
+bash cmd_scripts/train_new.sh --dataset tinyimagenet --data-dir /home/kaiser/dl_project/data/tiny-imagenet-200 --gpus 1 --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0 --output-dir debug-output/wavelet_training/tinyimagenet
+# ImageNet 数据就绪后，将 /data/imagenet 换成真实目录：
+bash cmd_scripts/train_new.sh --dataset Imagenet --data-dir /data/imagenet --gpus 1 --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0
+```
+
+输出位于 `输出根目录/模型名/时间戳_唯一后缀/`，包括生效参数 `args.txt`、模型结构 `model.txt`、
+每 epoch 的 JSON 指标 `log.txt` 和未融合权重 `checkpoint_0.pth`。日志和参数记录完整数据集长度、
+loader 批次数及基础/有效学习率；本地恢复训练沿用检查点父目录，多卡共享同一个运行目录。
+
+蒸馏教师必须使用对应数据集类别数，权重顶层为 `model`，严格加载并冻结参数。
+教师工厂需接受 `pretrained=False, num_classes=K, global_pool='avg'`，返回 `[B,K]` logits。
+以下教师路径是待替换的示例，需要提供真实匹配权重：
+
+```bash
+bash cmd_scripts/train_new.sh --dataset cifar100 --data-dir /home/kaiser/dl_project/data/cifar100 --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0 --distillation-type hard --teacher-model regnety_160 --teacher-path /weights/cifar100-teacher.pth
+bash cmd_scripts/train_new.sh --dataset tinyimagenet --data-dir /home/kaiser/dl_project/data/tiny-imagenet-200 --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0 --distillation-type soft --teacher-model regnety_160 --teacher-path /weights/tinyimagenet-teacher.pth --distillation-alpha 0.5 --distillation-tau 2
+bash cmd_scripts/train_new.sh --dataset Imagenet --data-dir /data/imagenet --batch-size 128 --epochs 1 --warmup-epochs 0 --cooldown-epochs 0 --distillation-type hard --teacher-model regnety_160 --teacher-path https://dl.fbaipublicfiles.com/deit/regnety_160-a5fe301d.pth
+```
+
+仅评估严格加载学生，`--distillation-type` 必须与检查点保存时的头配置一致；hard/soft 学生
+评估无需教师路径。以下检查点路径也需替换成实际训练输出：
+
+```bash
+bash cmd_scripts/train_new.sh --dataset cifar100 --data-dir /home/kaiser/dl_project/data/cifar100 --batch-size 128 --eval --resume /checkpoints/cifar100/checkpoint_0.pth --distillation-type none
+bash cmd_scripts/train_new.sh --dataset tinyimagenet --data-dir /home/kaiser/dl_project/data/tiny-imagenet-200 --batch-size 128 --eval --resume /checkpoints/tinyimagenet/checkpoint_0.pth --distillation-type none
+bash cmd_scripts/train_new.sh --dataset Imagenet --data-dir /data/imagenet --batch-size 128 --eval --resume /checkpoints/imagenet/checkpoint_0.pth --distillation-type none
+```
+
+早前 `debug_train_wavelet.py` 的 batch=2 随机数据结果不代表这里的真实数据验收。
+本次实际验证结果见 [训练验证记录](debug-output/wavelet_training/validation.md)。
+
+普通训练支持 `--max-train-batches 5`，每个 epoch 只训练前 5 个 batch，随后仍执行完整验证与
+checkpoint 保存；默认不限制训练 batch。两个真实数据集的短训练命令如下：
+
+```bash
+bash cmd_scripts/train_new.sh --dataset cifar100 --data-dir /home/kaiser/dl_project/data/cifar100 --batch-size 64 --epochs 1 --max-train-batches 5 --warmup-epochs 0 --cooldown-epochs 0 --output-dir debug-output/training_safety/cifar100
+bash cmd_scripts/train_new.sh --dataset tinyimagenet --data-dir /home/kaiser/dl_project/data/tiny-imagenet-200 --batch-size 64 --epochs 1 --max-train-batches 5 --warmup-epochs 0 --cooldown-epochs 0 --output-dir debug-output/training_safety/tinyimagenet
+```
+
+普通训练遇到 NaN 或 Inf loss 时，在该 batch 反向传播与参数更新前保存 `erro_{epoch}.pth` 和
+`erro_{epoch}.log`，随后抛出 `FloatingPointError` 以失败状态退出。epoch 与日志中的 batch 索引
+均从 0 开始。日志包含各进程 loss、学习率、训练配置、调用栈与保存状态；权重包含模型、
+optimizer、scheduler、AMP scaler、EMA 和异常位置。多卡由主进程保存，全部进程同步中断。
+若写盘失败，异常直接向上传播，日志中的 `checkpoint_save_started` 表示保存尚未完成。
+异常快照用于诊断，不作为已完成 epoch 直接续训，也不随普通 checkpoint 轮换删除。
+
+`checkpoint_best.pth` 按验证集 Top-1 提升保存，首次有效验证即使为 0 也保存。
+每个普通 checkpoint 都记录 `best_accuracy`，续训恢复历史最佳指标；旧 checkpoint 缺少该字段时，
+从同目录 `log.txt` 恢复截至该 epoch 的验证历史，缺少历史则明确报错。
+直接调用普通 `engine.train_one_epoch()` 时须提供 `checkpoint_writer`，避免异常诊断遗漏。
+五折训练使用独立的 `five_fold/engine.py::train_fold_one_epoch()`，保留原有训练行为，
+不使用普通训练的 batch 限制，本次短训练测试不包含五折流程。

@@ -28,9 +28,21 @@ class _HaarPair:
     def decompose(self, x):
         _validate_feature(x)
         height, width = x.shape[-2:]
+        # Pad odd dimensions at the bottom/right by replicating edge values.
+        # Boundary subbands differ from zero padding; match padding before comparing libraries.
+        # Keep the original size for cropping after reconstruction.
         x = F.pad(x, (0, width % 2, 0, height % 2), mode="replicate")
+        # Each 2x2 patch is arranged as [[a, b], [c, d]].
         a, b = x[..., 0::2, 0::2], x[..., 0::2, 1::2]
         c, d = x[..., 1::2, 0::2], x[..., 1::2, 1::2]
+        # Orthonormal Haar uses 1D coefficients +/-1/sqrt(2); their 2D outer
+        # products give +/-1/2, hence division by 2 below.
+        # Fixed order: LL, differences along width, differences along height,
+        # and diagonal detail. This module calls the last three LH, HL, HH;
+        # match actual filter directions rather than labels across libraries.
+        # PyWavelets dwt2 order (cA, cH, cV, cD) maps to indices [0, 2, 1, 3].
+        # This order also selects the high-frequency branches; changing it
+        # changes the behavior of existing trained weights.
         return ((a + b + c + d) / 2,
                 (a - b + c - d) / 2,
                 (a + b - c - d) / 2,
@@ -39,6 +51,7 @@ class _HaarPair:
     def reconstruct(self, subbands, original_hw):
         if len(subbands) != 4:
             raise ValueError("Haar reconstruction requires LL, LH, HL, HH")
+        # Use decompose's order; map external subbands by filter direction first.
         ll, lh, hl, hh = subbands
         _validate_feature(ll)
         if any(band.shape != ll.shape or band.dtype != ll.dtype or
@@ -50,11 +63,13 @@ class _HaarPair:
         height, width = original_hw
         if 2 * ll.shape[-2] - height not in (0, 1) or 2 * ll.shape[-1] - width not in (0, 1):
             raise ValueError("original_hw must match the Haar subbands before padding")
+        # The paired inverse restores [[a, b], [c, d]], then interleaves pixels.
         a, b = (ll + lh + hl + hh) / 2, (ll - lh + hl - hh) / 2
         c, d = (ll + lh - hl - hh) / 2, (ll - lh - hl + hh) / 2
         top = torch.stack((a, b), dim=-1).flatten(-2)
         bottom = torch.stack((c, d), dim=-1).flatten(-2)
         result = torch.stack((top, bottom), dim=-2).flatten(-3, -2)
+        # Remove the bottom/right padding added for odd input dimensions.
         return result[..., :height, :width]
 
 
@@ -171,15 +186,17 @@ class _LowFrequencyMamba2(nn.Module):
 
     def forward(self, x):
         batch, channels, height, width = x.shape
-        sequence = x.flatten(2).transpose(1, 2).contiguous()
-        sequence = self.out_adapter(self.mamba(self.in_adapter(sequence)))
-        return sequence.transpose(1, 2).reshape(batch, channels, height, width)
+        # Keep the adapters and fused SSM in FP32 even under outer CUDA AMP.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            sequence = x.float().flatten(2).transpose(1, 2).contiguous()
+            sequence = self.out_adapter(self.mamba(self.in_adapter(sequence)))
+            return sequence.transpose(1, 2).reshape(batch, channels, height, width)
 
 
 class WaveletBlock(nn.Module):
     """WT → low Mamba2 / three frequency branches → gates → IWT.
 
-    Parameters stay FP32; CUDA autocast is supported only in the low mixer.
+    Parameters, wavelet arithmetic and the low mixer stay FP32 under outer AMP.
     The production Mamba2 path requires CUDA. No residual or FFN is added.
     """
 
@@ -207,7 +224,7 @@ class WaveletBlock(nn.Module):
         input_dtype = x.dtype
         with torch.autocast(device_type="cuda", enabled=False):
             subbands, original_hw = self.haar.decompose(x.float())
-        # Leave the FP32 context before Mamba2 to preserve the caller's AMP policy.
+        # The low mixer owns its FP32 policy for every caller.
         low = self.low_mixer(subbands[0])
         with torch.autocast(device_type="cuda", enabled=False):
             low = self.low_gate(low.float())

@@ -1,0 +1,31 @@
+# Target: existing conda environment Experiment, Python 3.10, Linux x86_64.
+# Audited 2026-11-22 using conda list AND python -m pip list.
+# Already installed: packaging 26.3, pip 26.2.2, setuptools 84.2.1,
+# wheel 0.48.0, dwconv2d 0.0.0. These are not reinstalled here.
+# Only missing direct/runtime dependencies are listed; pip resolves transitives.
+# Official binary wheels avoid requiring torch during extension build metadata.
+# Candidate environment: installation and CUDA execution have NOT been verified.
+# CUDA target updated 2026-11-23; local Toolkit 12.1 is installed.
+# Install: conda activate Experiment
+#          export CUDA_HOME=/usr/local/cuda-12.1
+#          export PATH="$CUDA_HOME/bin:$PATH"
+#          python -m pip install -r request.txt
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.2.2+cu121
+torchvision==0.17.2+cu121
+triton==2.2.0
+numpy==1.26.4
+timm==0.5.4
+einops==0.8.0
+transformers==4.35.2
+pillow==10.4.0
+ninja==1.11.1.1
+
+# CPython 3.10 / torch 2.2 / CUDA 12.x / CXX11 ABI FALSE.
+# Upstream maps ALL CUDA 12.x PyTorch builds (including cu121) to cu122 wheels.
+# https://github.com/state-spaces/mamba/blob/v2.2.2/setup.py
+# https://github.com/Dao-AILab/causal-conv1d/blob/v1.4.0/setup.py
+# mamba-ssm also supplies selective_scan_cuda used by the original model import.
+mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2%2Bcu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.4.0/causal_conv1d-1.4.0%2Bcu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl

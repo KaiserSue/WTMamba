@@ -104,7 +104,7 @@ class WaveletTinyViM(nn.Module):
         return (logits + dist_logits) / 2
 
 
-def _create_wavelet_model(variant, pretrained=False, **kwargs):
+def _create_wavelet_model(variant, pretrained=False, num_classes=1000, distillation=True, **kwargs):
     if variant not in TinyViM_width:
         raise ValueError(f"unknown WaveletTinyViM variant: {variant!r}")
     if pretrained:
@@ -112,7 +112,8 @@ def _create_wavelet_model(variant, pretrained=False, **kwargs):
     if "layers" in kwargs or "embed_dims" in kwargs:
         raise ValueError("registered WaveletTinyViM variants have fixed layers and embed_dims")
     model = WaveletTinyViM(layers=list(TinyViM_depth[variant]),
-                          embed_dims=list(TinyViM_width[variant]), **kwargs)
+                          embed_dims=list(TinyViM_width[variant]),
+                          num_classes=num_classes, distillation=distillation, **kwargs)
     model.default_cfg = {
         "url": "", "num_classes": 1000, "input_size": (3, 224, 224),
         "pool_size": None, "crop_pct": 0.9, "interpolation": "bicubic",
@@ -123,15 +124,21 @@ def _create_wavelet_model(variant, pretrained=False, **kwargs):
 
 
 @register_model
-def WaveletTinyViM_S(pretrained=False, **kwargs):
-    return _create_wavelet_model("S", pretrained=pretrained, **kwargs)
+def WaveletTinyViM_S(pretrained=False, num_classes=1000, distillation=True, **kwargs):
+    """Build the S classifier; distillation training returns two logits tensors."""
+    return _create_wavelet_model("S", pretrained=pretrained, num_classes=num_classes,
+                                 distillation=distillation, **kwargs)
 
 
 @register_model
-def WaveletTinyViM_B(pretrained=False, **kwargs):
-    return _create_wavelet_model("B", pretrained=pretrained, **kwargs)
+def WaveletTinyViM_B(pretrained=False, num_classes=1000, distillation=True, **kwargs):
+    """Build the B classifier; distillation training returns two logits tensors."""
+    return _create_wavelet_model("B", pretrained=pretrained, num_classes=num_classes,
+                                 distillation=distillation, **kwargs)
 
 
 @register_model
-def WaveletTinyViM_L(pretrained=False, **kwargs):
-    return _create_wavelet_model("L", pretrained=pretrained, **kwargs)
+def WaveletTinyViM_L(pretrained=False, num_classes=1000, distillation=True, **kwargs):
+    """Build the L classifier; distillation training returns two logits tensors."""
+    return _create_wavelet_model("L", pretrained=pretrained, num_classes=num_classes,
+                                 distillation=distillation, **kwargs)
